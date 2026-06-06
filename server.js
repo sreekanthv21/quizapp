@@ -561,3 +561,6 @@ if (fs.existsSync(FLUTTER_WEB_PATH)) {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+// Export the app for Vercel serverless functions
+module.exports = app;
