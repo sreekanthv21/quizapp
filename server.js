@@ -11,14 +11,6 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Log browser console errors to server console
-app.post('/api/log-error', (req, res) => {
-  console.error('\n--- BROWSER CONSOLE ERROR ---');
-  console.error(req.body);
-  console.error('-----------------------------\n');
-  res.sendStatus(200);
-});
-
 try {
   let serviceAccount;
 
@@ -83,32 +75,8 @@ async function seedDefaultAdmin() {
   }
 }
 
-// Clean up scores of deprecated quizzes in Firestore on startup
-async function cleanDeprecatedScores() {
-  try {
-    const activeQuizIds = ['python_quiz', 'sql_quiz'];
-    const snapshot = await db.collection('scores').get();
-    let deleteCount = 0;
-    const batch = db.batch();
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      if (!activeQuizIds.includes(data.quizId)) {
-        batch.delete(doc.ref);
-        deleteCount++;
-      }
-    });
-    if (deleteCount > 0) {
-      await batch.commit();
-      console.log(`Startup Firestore Cleanup: Removed ${deleteCount} scores for deprecated quizzes.`);
-    }
-  } catch (err) {
-    console.error('Error cleaning up deprecated Firestore scores on startup:', err);
-  }
-}
-
 // Run Startup Tasks
 seedDefaultAdmin();
-cleanDeprecatedScores();
 
 // Dynamic Client Firebase Config Endpoint
 app.get('/api/firebase-config', (req, res) => {
@@ -265,7 +233,7 @@ app.post('/api/users/quiz-limits', async (req, res) => {
   }
 });
 
-// 3. Quizzes list endpoint
+// 3. Quiz Management Endpoints
 app.get('/api/quizzes', async (req, res) => {
   try {
     const snapshot = await db.collection('quizzes').get();
@@ -273,14 +241,77 @@ app.get('/api/quizzes', async (req, res) => {
     snapshot.forEach(doc => list.push(doc.data()));
     return res.json(list);
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    console.error('Error fetching quizzes:', e);
+    return res.status(500).json({ error: 'Failed to fetch quizzes: ' + e.message });
+  }
+});
+
+app.post('/api/quizzes', async (req, res) => {
+  const { id, title, description, timeLimit, attemptLimit } = req.body;
+  const quizId = id || 'quiz_' + Date.now();
+  const newQuiz = {
+    id: quizId,
+    title: title || 'New Quiz',
+    description: description || '',
+    timeLimit: parseInt(timeLimit) || 30,
+    attemptLimit: parseInt(attemptLimit) || 1,
+  };
+  try {
+    await db.collection('quizzes').doc(quizId).set(newQuiz);
+    return res.json({ success: true, quiz: newQuiz });
+  } catch (e) {
+    console.error('Error creating quiz:', e);
+    return res.status(400).json({ error: 'Failed to create quiz: ' + e.message });
+  }
+});
+
+app.put('/api/quizzes/:id', async (req, res) => {
+  const { id } = req.params;
+  const { title, description, timeLimit, attemptLimit } = req.body;
+  try {
+    await db.collection('quizzes').doc(id).update({
+      title,
+      description,
+      timeLimit: parseInt(timeLimit),
+      attemptLimit: parseInt(attemptLimit),
+    });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error(`Error updating quiz ${id}:`, e);
+    return res.status(400).json({ error: 'Failed to update quiz: ' + e.message });
+  }
+});
+
+app.delete('/api/quizzes/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.collection('quizzes').doc(id).delete();
+    // Delete associated questions and scores
+    const questionsSnapshot = await db.collection('questions').where('quizId', '==', id).get();
+    const qBatch = db.batch();
+    questionsSnapshot.forEach(doc => qBatch.delete(doc.ref));
+    if (!questionsSnapshot.empty) {
+      await qBatch.commit();
+    }
+
+    const scoresSnapshot = await db.collection('scores').where('quizId', '==', id).get();
+    const sBatch = db.batch();
+    scoresSnapshot.forEach(doc => sBatch.delete(doc.ref));
+    if (!scoresSnapshot.empty) {
+      await sBatch.commit();
+    }
+
+    return res.json({ success: true });
+  } catch (e) {
+    console.error(`Error deleting quiz ${id}:`, e);
+    return res.status(400).json({ error: 'Failed to delete quiz: ' + e.message });
   }
 });
 
 app.post('/api/quizzes/limit', async (req, res) => {
   const { quizId, limit } = req.body;
   if (!quizId || limit === undefined) {
-    return res.status(400).json({ error: 'quizId and limit are required' });
+    return res.status(400).json({ error: 'Quiz ID and limit are required' });
   }
   try {
     await db.collection('quizzes').doc(quizId).update({ attemptLimit: parseInt(limit) });
@@ -519,44 +550,13 @@ app.get('/api/scores', async (req, res) => {
   }
 });
 
-// Serve compiled Flutter Web frontend if it exists
-const FLUTTER_WEB_PATH = path.join(__dirname, 'flutter_quiz_app', 'build', 'web');
-if (fs.existsSync(FLUTTER_WEB_PATH)) {
-  app.use(express.static(FLUTTER_WEB_PATH, {
-    etag: false,
-    maxAge: 0,
-    setHeaders: (res, filePath) => {
-      res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    }
-  }));
-  app.get('*', (req, res) => {
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.sendFile(path.join(FLUTTER_WEB_PATH, 'index.html'));
+app.get('/', (req, res) => {
+  res.json({ 
+    message: "Online Quiz Platform API is running.",
+    status: "Healthy",
+    timestamp: new Date().toISOString()
   });
-} else {
-  app.get('/', (req, res) => {
-    res.send(`
-      <html>
-        <head>
-          <title>Quiz Platform Backend</title>
-          <style>
-            body { font-family: sans-serif; background: #0d111b; color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-            .card { background: #161b22; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); text-align: center; max-width: 500px; }
-            h1 { color: #00f2fe; margin-top: 0; }
-            code { background: #21262d; padding: 4px 8px; border-radius: 4px; font-family: monospace; }
-          </style>
-        </head>
-        <body>
-          <div class="card">
-            <h1>Online Quiz Platform APIs</h1>
-            <p>Backend Server is running successfully on port ${PORT}.</p>
-            <p>Flutter Web frontend is not built yet. Run <code>npm run build</code> to compile it.</p>
-          </div>
-        </body>
-      </html>
-    `);
-  });
-}
+});
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
