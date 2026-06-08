@@ -321,6 +321,236 @@ app.post('/api/quizzes/limit', async (req, res) => {
   }
 });
 
+// ── Quiz Session Endpoints (Persistent Timer & Session Locking) ──
+
+// Helper to automatically submit an expired session
+async function autoSubmitSession(sessionRef, session) {
+  try {
+    const { email, quizId, answers } = session;
+    console.log(`Auto-submitting expired session ${sessionRef.id} for ${email}`);
+
+    // Fetch questions
+    const qSnapshot = await db.collection('questions').where('quizId', '==', quizId).get();
+    const questions = [];
+    qSnapshot.forEach(doc => questions.push(doc.data()));
+
+    // Fetch quiz metadata
+    const quizDoc = await db.collection('quizzes').doc(quizId).get();
+    const quizTitle = quizDoc.exists ? quizDoc.data().title : 'General Quiz';
+
+    let score = 0;
+    let maxScore = 0;
+    let correctCount = 0;
+    let incorrectCount = 0;
+
+    questions.forEach(q => {
+      maxScore += q.marks;
+      const selected = answers[q.id];
+      if (selected === undefined || selected === null) {
+        // Skipped
+      } else if (parseInt(selected) === q.correctIndex) {
+        score += q.marks;
+        correctCount++;
+      } else {
+        score += q.negativeMarks;
+        incorrectCount++;
+      }
+    });
+
+    const pct = maxScore > 0 ? (score / maxScore) * 100 : 0;
+    let grade = 'F';
+    if (pct >= 90) grade = 'A+';
+    else if (pct >= 80) grade = 'A';
+    else if (pct >= 70) grade = 'B';
+    else if (pct >= 60) grade = 'C';
+    else if (pct >= 50) grade = 'D';
+
+    const newScore = {
+      email,
+      quizId,
+      quizTitle,
+      score: parseFloat(score.toFixed(2)),
+      maxScore,
+      correctCount,
+      incorrectCount,
+      grade,
+      answers: answers || {},
+      timestamp: new Date().toISOString(),
+      autoSubmitted: true
+    };
+
+    await db.collection('scores').add(newScore);
+    await sessionRef.update({ status: 'completed' });
+    console.log(`Successfully auto-submitted expired session ${sessionRef.id} for ${email}`);
+  } catch (err) {
+    console.error(`Failed to auto-submit expired session ${sessionRef.id}:`, err);
+    // fallback: just update status to prevent infinite loop
+    await sessionRef.update({ status: 'expired' });
+  }
+}
+
+// Helper to find and clean up all expired active sessions
+async function cleanExpiredSessions(email) {
+  try {
+    let queryRef = db.collection('quiz_sessions').where('status', '==', 'active');
+    if (email) {
+      queryRef = queryRef.where('email', '==', email);
+    }
+    const snapshot = await queryRef.get();
+    for (const doc of snapshot.docs) {
+      const session = doc.data();
+      const startTime = new Date(session.startTime).getTime();
+      const elapsed = (Date.now() - startTime) / 1000;
+      const remaining = session.durationSeconds - elapsed;
+      if (remaining <= 0) {
+        await autoSubmitSession(doc.ref, session);
+      }
+    }
+  } catch (err) {
+    console.error('Error cleaning expired sessions:', err);
+  }
+}
+
+// Start or resume a quiz session
+app.post('/api/quiz-session/start', async (req, res) => {
+  const { email, quizId } = req.body;
+  if (!email || !quizId) {
+    return res.status(400).json({ error: 'Email and quizId are required' });
+  }
+  try {
+    // Clean expired sessions for this student first
+    await cleanExpiredSessions(email);
+
+    // Check if there's any active session for this student
+    const activeSessions = await db.collection('quiz_sessions')
+      .where('email', '==', email)
+      .where('status', '==', 'active')
+      .get();
+
+    for (const doc of activeSessions.docs) {
+      const session = doc.data();
+      const startTime = new Date(session.startTime).getTime();
+      const elapsed = (Date.now() - startTime) / 1000;
+      const remaining = session.durationSeconds - elapsed;
+
+      if (remaining > 0) {
+        // Active session still has time
+        if (session.quizId === quizId) {
+          // Resume existing session for same quiz
+          return res.json({
+            success: true,
+            sessionId: doc.id,
+            secondsRemaining: Math.max(0, Math.floor(remaining)),
+            answers: session.answers || {},
+            resumed: true
+          });
+        } else {
+          // Different quiz is active - block
+          return res.status(409).json({
+            success: false,
+            error: 'You have an active session for another quiz. Complete or wait for it to expire.',
+            activeQuizId: session.quizId
+          });
+        }
+      } else {
+        // Session expired - mark as expired
+        await doc.ref.update({ status: 'expired' });
+      }
+    }
+
+    // No active session - create a new one
+    const quizDoc = await db.collection('quizzes').doc(quizId).get();
+    if (!quizDoc.exists) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+    const quizData = quizDoc.data();
+    const durationSeconds = (quizData.timeLimit || 30) * 60;
+
+    const sessionData = {
+      email,
+      quizId,
+      startTime: new Date().toISOString(),
+      durationSeconds,
+      status: 'active',
+      answers: {}
+    };
+
+    const sessionRef = await db.collection('quiz_sessions').add(sessionData);
+    return res.json({
+      success: true,
+      sessionId: sessionRef.id,
+      secondsRemaining: durationSeconds,
+      answers: {},
+      resumed: false
+    });
+  } catch (e) {
+    console.error('Error starting quiz session:', e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Get current active session status for a student
+app.get('/api/quiz-session/status', async (req, res) => {
+  const { email } = req.query;
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+  try {
+    // Clean expired sessions for this student first
+    await cleanExpiredSessions(email);
+
+    const activeSessions = await db.collection('quiz_sessions')
+      .where('email', '==', email)
+      .where('status', '==', 'active')
+      .get();
+
+    for (const doc of activeSessions.docs) {
+      const session = doc.data();
+      const startTime = new Date(session.startTime).getTime();
+      const elapsed = (Date.now() - startTime) / 1000;
+      const remaining = session.durationSeconds - elapsed;
+
+      if (remaining > 0) {
+        return res.json({
+          active: true,
+          sessionId: doc.id,
+          quizId: session.quizId,
+          secondsRemaining: Math.max(0, Math.floor(remaining)),
+          answers: session.answers || {}
+        });
+      } else {
+        // Expired - mark it
+        await doc.ref.update({ status: 'expired' });
+      }
+    }
+
+    return res.json({ active: false });
+  } catch (e) {
+    console.error('Error checking quiz session status:', e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Save quiz progress mid-session
+app.post('/api/quiz-session/save-progress', async (req, res) => {
+  const { sessionId, answers } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId is required' });
+  }
+  try {
+    const sessionRef = db.collection('quiz_sessions').doc(sessionId);
+    const sessionDoc = await sessionRef.get();
+    if (!sessionDoc.exists) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    await sessionRef.update({ answers: answers || {} });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('Error saving quiz progress:', e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 
 // 4. Question Endpoints
 app.get('/api/questions', async (req, res) => {
@@ -478,6 +708,28 @@ app.post('/api/theme', async (req, res) => {
 app.post('/api/submit-quiz', async (req, res) => {
   const { email, answers, quizId } = req.body;
   try {
+    // Verify active session exists and is valid (not expired)
+    const activeSessions = await db.collection('quiz_sessions')
+      .where('email', '==', email)
+      .where('quizId', '==', quizId)
+      .where('status', '==', 'active')
+      .get();
+      
+    if (activeSessions.empty) {
+      return res.status(403).json({ error: 'No active session found for this quiz. Submission rejected.' });
+    }
+
+    const sessionDoc = activeSessions.docs[0];
+    const session = sessionDoc.data();
+    const startTime = new Date(session.startTime).getTime();
+    const elapsed = (Date.now() - startTime) / 1000;
+    // Allow a 15-second grace period for latency
+    if (elapsed > session.durationSeconds + 15) {
+      // Session has expired beyond grace period. Auto-submit based on their last saved progress.
+      await autoSubmitSession(sessionDoc.ref, session);
+      return res.status(403).json({ error: 'Quiz time limit exceeded. Progress auto-submitted.' });
+    }
+
     // Fetch questions
     const qSnapshot = await db.collection('questions').where('quizId', '==', quizId).get();
     const questions = [];
@@ -528,6 +780,12 @@ app.post('/api/submit-quiz', async (req, res) => {
     };
 
     await db.collection('scores').add(newScore);
+
+    // Mark the active quiz session as completed to release the lock
+    for (const doc of activeSessions.docs) {
+      await doc.ref.update({ status: 'completed' });
+    }
+
     return res.json({ success: true, result: newScore });
   } catch (e) {
     return res.status(400).json({ error: e.message });
@@ -537,6 +795,9 @@ app.post('/api/submit-quiz', async (req, res) => {
 app.get('/api/scores', async (req, res) => {
   const { email } = req.query;
   try {
+    // Clean up any expired sessions first to ensure scores list is up-to-date
+    await cleanExpiredSessions(email);
+
     let queryRef = db.collection('scores');
     if (email) {
       queryRef = queryRef.where('email', '==', email);
