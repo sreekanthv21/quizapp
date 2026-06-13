@@ -11,6 +11,16 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// HTTP Security Headers Custom Middleware
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' http://localhost:3000 https://quizapp-orcin-iota.vercel.app; img-src 'self' data:;");
+  next();
+});
+
 try {
   let serviceAccount;
 
@@ -35,6 +45,91 @@ try {
 }
 
 const db = admin.firestore();
+
+// --- SECURITY ENGINE (JWT & Middlewares) ---
+const crypto = require('crypto');
+const JWT_SECRET = process.env.JWT_SECRET || 'rapidhunt-secure-cryptographic-signing-key-99881122';
+
+function signToken(payload) {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const body = Buffer.from(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + 86400 * 7 })).toString('base64url'); // Valid for 7 days
+  const signature = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
+  return `${header}.${body}.${signature}`;
+}
+
+function verifyToken(token) {
+  try {
+    const [header, body, signature] = token.split('.');
+    const expectedSignature = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
+    if (signature !== expectedSignature) return null;
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+    if (payload.exp < Date.now() / 1000) return null; // Expired
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Authentication Middleware
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Format: Bearer <token>
+
+  if (!token) {
+    return res.status(401).json({ success: false, error: 'Access Denied: No Token Provided' });
+  }
+
+  const user = verifyToken(token);
+  if (!user) {
+    return res.status(403).json({ success: false, error: 'Access Denied: Invalid or Expired Token' });
+  }
+
+  req.user = user;
+  next();
+}
+
+// RBAC Middleware - Admins only
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({ success: false, error: 'Access Denied: Administrator Role Required' });
+  }
+  next();
+}
+
+// --- Custom Rate Limiter for Login/Registration ---
+const loginAttempts = new Map();
+
+function loginRateLimiter(req, res, next) {
+  const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const now = Date.now();
+  const limitWindow = 15 * 60 * 1000; // 15 minutes
+  const maxAttempts = 10; // Max 10 attempts per IP per window
+
+  if (!loginAttempts.has(ip)) {
+    loginAttempts.set(ip, []);
+  }
+
+  let attempts = loginAttempts.get(ip);
+  attempts = attempts.filter(time => now - time < limitWindow);
+
+  if (attempts.length >= maxAttempts) {
+    return res.status(429).json({
+      success: false,
+      error: 'Too many login or registration attempts. Please try again after 15 minutes.'
+    });
+  }
+
+  attempts.push(now);
+  loginAttempts.set(ip, attempts);
+  next();
+}
+
+// --- Input Validation Helpers ---
+function isValidEmail(email) {
+  if (!email || typeof email !== 'string') return false;
+  const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return re.test(email.toLowerCase());
+}
 
 // Seed Default Administrator User on startup
 async function seedDefaultAdmin() {
@@ -95,8 +190,14 @@ app.get('/api/firebase-config', (req, res) => {
 });
 
 // 1. Authentication Sync Endpoints
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginRateLimiter, async (req, res) => {
   const { email, password } = req.body;
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ success: false, error: 'Please enter a valid email address.' });
+  }
+  if (!password || password.length < 6) {
+    return res.status(400).json({ success: false, error: 'Password must be at least 6 characters long.' });
+  }
   try {
     const userRecord = await admin.auth().getUserByEmail(email);
     const userDoc = await db.collection('users').doc(userRecord.uid).get();
@@ -105,7 +206,9 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ success: false, error: 'email doesnot exist' });
     }
     
-    return res.json({ success: true, user: userDoc.data() });
+    const userData = userDoc.data();
+    const token = signToken({ email: userData.email, role: userData.role, uid: userData.uid });
+    return res.json({ success: true, user: userData, token });
   } catch (e) {
     if (e.code === 'auth/user-not-found') {
       return res.status(400).json({ success: false, error: 'email doesnot exist' });
@@ -114,8 +217,14 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', loginRateLimiter, async (req, res) => {
   const { email, password, displayName, role, uid } = req.body;
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ success: false, error: 'Please enter a valid email address.' });
+  }
+  if (!uid && (!password || password.length < 6)) {
+    return res.status(400).json({ success: false, error: 'Password must be at least 6 characters long.' });
+  }
   const userRole = role || (email.toLowerCase().includes('admin') ? 'admin' : 'student');
   const approved = userRole === 'admin' ? true : false;
 
@@ -160,14 +269,15 @@ app.post('/api/auth/register', async (req, res) => {
     }
     await admin.auth().setCustomUserClaims(finalUid, claims);
 
-    return res.json({ success: true, user });
+    const token = signToken({ email: user.email, role: user.role, uid: user.uid });
+    return res.json({ success: true, user, token });
   } catch (e) {
     return res.status(400).json({ success: false, error: e.message });
   }
 });
 
 // 2. User Management Endpoints
-app.get('/api/users', async (req, res) => {
+app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const snapshot = await db.collection('users').get();
     const list = [];
@@ -178,7 +288,7 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-app.post('/api/users/approve', async (req, res) => {
+app.post('/api/users/approve', authenticateToken, requireAdmin, async (req, res) => {
   const { email, approved } = req.body;
   try {
     const userRecord = await admin.auth().getUserByEmail(email);
@@ -195,10 +305,14 @@ app.post('/api/users/approve', async (req, res) => {
   }
 });
 
-app.get('/api/users/profile', async (req, res) => {
+app.get('/api/users/profile', authenticateToken, async (req, res) => {
   const { email } = req.query;
   if (!email) {
     return res.status(400).json({ error: 'Email is required' });
+  }
+  // RBAC: Must be the user themselves or an admin
+  if (req.user.email !== email && req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Access Denied: You can only view your own profile.' });
   }
   try {
     const userRecord = await admin.auth().getUserByEmail(email);
@@ -212,7 +326,7 @@ app.get('/api/users/profile', async (req, res) => {
   }
 });
 
-app.post('/api/users/quiz-limits', async (req, res) => {
+app.post('/api/users/quiz-limits', authenticateToken, requireAdmin, async (req, res) => {
   const { email, quizId, limit } = req.body;
   if (!email || !quizId) {
     return res.status(400).json({ error: 'Email and quizId are required' });
@@ -234,7 +348,7 @@ app.post('/api/users/quiz-limits', async (req, res) => {
 });
 
 // 3. Quiz Management Endpoints
-app.get('/api/quizzes', async (req, res) => {
+app.get('/api/quizzes', authenticateToken, async (req, res) => {
   try {
     const snapshot = await db.collection('quizzes').get();
     const list = [];
@@ -246,15 +360,26 @@ app.get('/api/quizzes', async (req, res) => {
   }
 });
 
-app.post('/api/quizzes', async (req, res) => {
+app.post('/api/quizzes', authenticateToken, requireAdmin, async (req, res) => {
   const { id, title, description, timeLimit, attemptLimit } = req.body;
-  const quizId = id || 'quiz_' + Date.now();
+  if (!title || title.trim() === '') {
+    return res.status(400).json({ error: 'Quiz title is required.' });
+  }
+  const parsedTimeLimit = parseInt(timeLimit);
+  const parsedAttemptLimit = parseInt(attemptLimit);
+  if (isNaN(parsedTimeLimit) || parsedTimeLimit <= 0) {
+    return res.status(400).json({ error: 'Time limit must be a positive integer.' });
+  }
+  if (isNaN(parsedAttemptLimit) || parsedAttemptLimit <= 0) {
+    return res.status(400).json({ error: 'Attempt limit must be a positive integer.' });
+  }
+  const quizId = id || 'quiz_' + crypto.randomBytes(8).toString('hex'); // Obfuscated ID
   const newQuiz = {
     id: quizId,
-    title: title || 'New Quiz',
+    title: title.trim(),
     description: description || '',
-    timeLimit: parseInt(timeLimit) || 30,
-    attemptLimit: parseInt(attemptLimit) || 1,
+    timeLimit: parsedTimeLimit,
+    attemptLimit: parsedAttemptLimit,
   };
   try {
     await db.collection('quizzes').doc(quizId).set(newQuiz);
@@ -265,15 +390,26 @@ app.post('/api/quizzes', async (req, res) => {
   }
 });
 
-app.put('/api/quizzes/:id', async (req, res) => {
+app.put('/api/quizzes/:id', authenticateToken, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { title, description, timeLimit, attemptLimit } = req.body;
+  if (!title || title.trim() === '') {
+    return res.status(400).json({ error: 'Quiz title is required.' });
+  }
+  const parsedTimeLimit = parseInt(timeLimit);
+  const parsedAttemptLimit = parseInt(attemptLimit);
+  if (isNaN(parsedTimeLimit) || parsedTimeLimit <= 0) {
+    return res.status(400).json({ error: 'Time limit must be a positive integer.' });
+  }
+  if (isNaN(parsedAttemptLimit) || parsedAttemptLimit <= 0) {
+    return res.status(400).json({ error: 'Attempt limit must be a positive integer.' });
+  }
   try {
     await db.collection('quizzes').doc(id).update({
-      title,
-      description,
-      timeLimit: parseInt(timeLimit),
-      attemptLimit: parseInt(attemptLimit),
+      title: title.trim(),
+      description: description || '',
+      timeLimit: parsedTimeLimit,
+      attemptLimit: parsedAttemptLimit,
     });
     return res.json({ success: true });
   } catch (e) {
@@ -282,7 +418,7 @@ app.put('/api/quizzes/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/quizzes/:id', async (req, res) => {
+app.delete('/api/quizzes/:id', authenticateToken, requireAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     await db.collection('quizzes').doc(id).delete();
@@ -308,7 +444,7 @@ app.delete('/api/quizzes/:id', async (req, res) => {
   }
 });
 
-app.post('/api/quizzes/limit', async (req, res) => {
+app.post('/api/quizzes/limit', authenticateToken, requireAdmin, async (req, res) => {
   const { quizId, limit } = req.body;
   if (!quizId || limit === undefined) {
     return res.status(400).json({ error: 'Quiz ID and limit are required' });
@@ -393,7 +529,7 @@ async function autoSubmitSession(sessionRef, session) {
 async function cleanExpiredSessions(email) {
   try {
     let queryRef = db.collection('quiz_sessions').where('status', '==', 'active');
-    if (email) {
+    if (email && email.trim() !== '') {
       queryRef = queryRef.where('email', '==', email);
     }
     const snapshot = await queryRef.get();
@@ -412,10 +548,13 @@ async function cleanExpiredSessions(email) {
 }
 
 // Start or resume a quiz session
-app.post('/api/quiz-session/start', async (req, res) => {
+app.post('/api/quiz-session/start', authenticateToken, async (req, res) => {
   const { email, quizId } = req.body;
   if (!email || !quizId) {
     return res.status(400).json({ error: 'Email and quizId are required' });
+  }
+  if (req.user.email !== email && req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Access Denied: You cannot start a session for another user.' });
   }
   try {
     // Clean expired sessions for this student first
@@ -490,10 +629,13 @@ app.post('/api/quiz-session/start', async (req, res) => {
 });
 
 // Get current active session status for a student
-app.get('/api/quiz-session/status', async (req, res) => {
+app.get('/api/quiz-session/status', authenticateToken, async (req, res) => {
   const { email } = req.query;
   if (!email) {
     return res.status(400).json({ error: 'Email is required' });
+  }
+  if (req.user.email !== email && req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Access Denied: You cannot view status of another user.' });
   }
   try {
     // Clean expired sessions for this student first
@@ -532,7 +674,7 @@ app.get('/api/quiz-session/status', async (req, res) => {
 });
 
 // Save quiz progress mid-session
-app.post('/api/quiz-session/save-progress', async (req, res) => {
+app.post('/api/quiz-session/save-progress', authenticateToken, async (req, res) => {
   const { sessionId, answers } = req.body;
   if (!sessionId) {
     return res.status(400).json({ error: 'sessionId is required' });
@@ -542,6 +684,10 @@ app.post('/api/quiz-session/save-progress', async (req, res) => {
     const sessionDoc = await sessionRef.get();
     if (!sessionDoc.exists) {
       return res.status(404).json({ error: 'Session not found' });
+    }
+    const session = sessionDoc.data();
+    if (req.user.email !== session.email && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access Denied: You cannot modify progress of another user.' });
     }
     await sessionRef.update({ answers: answers || {} });
     return res.json({ success: true });
@@ -553,7 +699,7 @@ app.post('/api/quiz-session/save-progress', async (req, res) => {
 
 
 // 4. Question Endpoints
-app.get('/api/questions', async (req, res) => {
+app.get('/api/questions', authenticateToken, async (req, res) => {
   const { quizId } = req.query;
   try {
     let queryRef = db.collection('questions');
@@ -563,25 +709,65 @@ app.get('/api/questions', async (req, res) => {
     const snapshot = await queryRef.get();
     const list = [];
     snapshot.forEach(doc => list.push(doc.data()));
+
+    // Payload Minimization: Remove correctIndex for students taking live exam
+    if (req.user.role !== 'admin') {
+      const scoresSnapshot = await db.collection('scores')
+        .where('email', '==', req.user.email)
+        .where('quizId', '==', quizId)
+        .get();
+      
+      const hasCompleted = !scoresSnapshot.empty;
+      if (!hasCompleted) {
+        list.forEach(q => {
+          delete q.correctIndex;
+        });
+      }
+    }
+
     return res.json(list);
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
 });
 
-app.post('/api/questions', async (req, res) => {
+app.post('/api/questions', authenticateToken, requireAdmin, async (req, res) => {
   const { id, quizId, text, codeSnippet, options, correctIndex, marks, negativeMarks } = req.body;
+  if (!text || text.trim() === '') {
+    return res.status(400).json({ error: 'Question text is required.' });
+  }
+  if (!Array.isArray(options) || options.length !== 4) {
+    return res.status(400).json({ error: 'Options must be an array of exactly 4 choices.' });
+  }
+  for (let opt of options) {
+    if (typeof opt !== 'string' || opt.trim() === '') {
+      return res.status(400).json({ error: 'All 4 options must be non-empty strings.' });
+    }
+  }
+  const parsedCorrectIndex = parseInt(correctIndex);
+  if (isNaN(parsedCorrectIndex) || parsedCorrectIndex < 0 || parsedCorrectIndex > 3) {
+    return res.status(400).json({ error: 'Correct index must be an integer between 0 and 3.' });
+  }
+  const parsedMarks = parseFloat(marks);
+  const parsedNegMarks = parseFloat(negativeMarks);
+  if (isNaN(parsedMarks) || parsedMarks <= 0) {
+    return res.status(400).json({ error: 'Question marks must be a positive number.' });
+  }
+  if (isNaN(parsedNegMarks) || parsedNegMarks > 0) {
+    return res.status(400).json({ error: 'Negative marks must be 0 or a negative number.' });
+  }
+
   const qId = id || 'q_' + Date.now(); // Ensure quizId is passed from frontend
 
   const newQuestion = {
     id: qId,
     quizId: quizId || 'quiz1',
-    text,
+    text: text.trim(),
     codeSnippet: codeSnippet || '',
-    options,
-    correctIndex: parseInt(correctIndex),
-    marks: parseFloat(marks),
-    negativeMarks: parseFloat(negativeMarks)
+    options: options.map(opt => opt.trim()),
+    correctIndex: parsedCorrectIndex,
+    marks: parsedMarks,
+    negativeMarks: parsedNegMarks
   };
 
   try {
@@ -592,7 +778,7 @@ app.post('/api/questions', async (req, res) => {
   }
 });
 
-app.delete('/api/questions/:id', async (req, res) => {
+app.delete('/api/questions/:id', authenticateToken, requireAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     await db.collection('questions').doc(id).delete();
@@ -705,8 +891,11 @@ app.post('/api/theme', async (req, res) => {
 });
 
 // 6. Score Submission Endpoints
-app.post('/api/submit-quiz', async (req, res) => {
+app.post('/api/submit-quiz', authenticateToken, async (req, res) => {
   const { email, answers, quizId } = req.body;
+  if (req.user.email !== email && req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Access Denied: You cannot submit a quiz for another user.' });
+  }
   try {
     // Verify active session exists and is valid (not expired)
     const activeSessions = await db.collection('quiz_sessions')
@@ -792,14 +981,25 @@ app.post('/api/submit-quiz', async (req, res) => {
   }
 });
 
-app.get('/api/scores', async (req, res) => {
+app.get('/api/scores', authenticateToken, async (req, res) => {
   const { email } = req.query;
+  // RBAC: If fetching all history (no email query), only allow admins.
+  // If fetching specific history (email query), only allow self or admins.
+  if (!email || email.trim() === '') {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access Denied: Student cannot fetch global score history.' });
+    }
+  } else {
+    if (req.user.email !== email && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access Denied: You cannot access score history of another student.' });
+    }
+  }
   try {
     // Clean up any expired sessions first to ensure scores list is up-to-date
     await cleanExpiredSessions(email);
 
     let queryRef = db.collection('scores');
-    if (email) {
+    if (email && email.trim() !== '') {
       queryRef = queryRef.where('email', '==', email);
     }
     const snapshot = await queryRef.get();
